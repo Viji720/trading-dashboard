@@ -1,0 +1,10 @@
+{
+  "weekday_policy": "regular",
+  "sessions": {
+    "2026-11-08": {
+      "type": "special",
+      "label": "Muhurat trading",
+      "source": "https://www.nseindia.com/resources/exchange-communication-holidays?apiversion=v2"
+    }
+  }
+}

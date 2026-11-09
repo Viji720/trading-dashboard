@@ -1,0 +1,509 @@
+--- a/backend/scanner.py
++++ b/backend/scanner.py
+@@ -7,6 +7,8 @@
+ from statistics import mean
+ from math import isfinite
+ 
++from sessions import volume_context
++
+ DATA = Path(__file__).parent / "data"
+ 
+ 
+@@ -19,6 +21,7 @@
+         raise FileNotFoundError(path.name)
+ 
+     rows = []
++    seen = set()
+ 
+     with path.open(newline="", encoding="utf-8-sig") as f:
+         for raw in csv.DictReader(f):
+@@ -26,6 +29,10 @@
+                 raw["date"].strip(), "%Y-%m-%d"
+             ).date()
+ 
++            if day in seen:
++                raise ValueError("Duplicate dates")
++            seen.add(day)
++
+             v = {
+                 k: float(raw[k])
+                 for k in ("open", "high", "low", "close", "volume")
+@@ -34,6 +41,8 @@
+             if not all(isfinite(x) for x in v.values()):
+                 raise ValueError(f"Non-finite candle {day}")
+ 
++            if v["volume"] == 0:
++                continue  # provider placeholder, never a trading candle
+             if (
+                 min(v["open"], v["high"], v["low"], v["close"]) <= 0
+                 or v["volume"] <= 0
+@@ -43,7 +52,7 @@
+             ):
+                 raise ValueError(f"Invalid candle {day}")
+ 
+-            rows.append({"date": day.isoformat(), **v})
++            rows.append({"date": day.isoformat(), **v, "complete": raw.get("complete", "true").strip().lower() not in ("false", "0", "no")})
+ 
+     rows.sort(key=lambda x: x["date"])
+ 
+@@ -64,11 +73,11 @@
+ def evaluate_window(rows, volume_ratio, breakout_pct):
+     n = len(rows)
+     closes = [r["close"] for r in rows]
+-    curve = smooth(closes)
++    curve = smooth(closes[:-1])
+     last = rows[-1]
+ 
+     # Exclude the signal candle from pattern fitting.
+-    previous = curve[:-1]
++    previous = curve
+     m = len(previous)
+ 
+     # Bottom should lie within the central 20%-80%.
+@@ -156,15 +165,14 @@
+     if right_consistency < 0.50:
+         reasons.append("Irregular right-side recovery")
+ 
+-    # Resistance derived from the shoulders.
+-    resistance = max(left, right)
+-
+-    prior_volumes = [
+-        r["volume"] for r in rows[-21:-1]
+-    ]
+-
+-    avg_volume = mean(prior_volumes)
+-    relvol = last["volume"] / avg_volume
++    # Neckline is fixed from historical left-shoulder highs, before recovery.
++    resistance = max(r["high"] for r in rows[:shoulder_size])
++    volume = volume_context(rows, volume_ratio)
++    threshold = resistance * (1 + breakout_pct / 100)
++    crossings = [i for i in range(bottom_index + 1, n)
++                 if rows[i]["close"] >= threshold and rows[i-1]["close"] < threshold]
++    breakout_index = crossings[-1] if crossings else None
++    recent = breakout_index is not None and n - 1 - breakout_index <= 5
+ 
+     distance = (
+         last["close"] / resistance - 1
+@@ -187,7 +195,9 @@
+     confirmed = (
+         valid
+         and distance >= breakout_pct
+-        and relvol >= volume_ratio
++        and recent
++        and volume["volume_confirmed"]
++        and volume_context(rows[:breakout_index+1], volume_ratio)["volume_confirmed"]
+     )
+ 
+     if not valid:
+@@ -195,6 +205,9 @@
+ 
+     elif confirmed:
+         status = "Confirmed breakout"
++
++    elif distance >= breakout_pct and not recent:
++        status = "Above resistance - breakout not recent"
+ 
+     elif distance >= breakout_pct:
+         status = "Breakout - volume unconfirmed"
+@@ -213,7 +226,12 @@
+         "score": score,
+         "resistance": round(resistance, 2),
+         "close": round(last["close"], 2),
+-        "volume_ratio": round(relvol, 2),
++        **volume,
++        "pattern_valid": valid,
++        "price_breakout": distance >= breakout_pct,
++        "breakout_recent": recent,
++        "breakout_date": rows[breakout_index]["date"] if breakout_index is not None else None,
++        "right_shoulder": rows[-2]["date"],
+         "distance_pct": round(distance, 2),
+         "depth_pct": round(depth * 100, 2),
+         "shoulder_difference_pct": round(symmetry * 100, 2),
+@@ -274,6 +292,7 @@
+         "Confirmed breakout": 5,
+         "Breakout - volume unconfirmed": 4,
+         "Above resistance - unconfirmed": 3,
++        "Above resistance - breakout not recent": 3,
+         "Near breakout": 2,
+         "Forming": 1,
+     }
+@@ -332,6 +351,7 @@
+         "source": "USER_PROVIDED_CSV",
+         "scanned_files": len(files),
+         "signals": signals,
++        "symbols": [f.stem.upper() for f in files],
+         "errors": errors,
+         "disclaimer": (
+             "Experimental heuristic signals. "
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -95,3 +95,20 @@
+     if not 60<=lookback<=250 or not 1<=volume_ratio<=5 or not 0<=breakout_pct<=5:
+         raise HTTPException(400,'Invalid scanner settings')
+     return scan_all(lookback,volume_ratio,breakout_pct)
++
++
++@app.get('/api/history/{symbol}')
++def historical_candles(symbol: str, lookback: int = 120, volume_ratio: float = 1.5, breakout_pct: float = 1.0):
++    from scanner import load_csv, detect
++    from sessions import metadata
++    if not 60 <= lookback <= 250 or not 1 <= volume_ratio <= 5 or not 0 <= breakout_pct <= 5:
++        raise HTTPException(400, 'Invalid scanner settings')
++    try:
++        rows = load_csv(symbol)
++        return {'symbol': symbol.upper(), 'timeframe': '1d', 'synthetic': False,
++                'source': 'USER_PROVIDED_CSV', 'candles': [{**r, **metadata(r)} for r in rows],
++                'pattern': detect(rows, lookback, volume_ratio, breakout_pct)}
++    except FileNotFoundError:
++        raise HTTPException(404, 'No historical CSV for symbol')
++    except (ValueError, KeyError) as exc:
++        raise HTTPException(400, str(exc))
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -1,3 +1,4 @@
+ fastapi>=0.115,<1
+ uvicorn>=0.30,<1
+ pydantic>=2,<3
++tzdata>=2025.1; sys_platform == "win32"
+--- /dev/null
++++ b/backend/sessions.py
+@@ -0,0 +1,45 @@
++"""Configurable session overrides. Weekdays are assumed regular, not verified.
++
++Unknown/weekend, special and incomplete candles never confirm volume.
++"""
++import json
++from datetime import datetime, time
++from pathlib import Path
++from zoneinfo import ZoneInfo
++
++CONFIG = Path(__file__).with_name('sessions.json')
++
++
++def metadata(row, config=None, now=None):
++    if config is None:
++        config = json.loads(CONFIG.read_text(encoding='utf-8'))
++    day = datetime.strptime(row['date'], '%Y-%m-%d').date()
++    override = config.get('sessions', {}).get(row['date'], {})
++    kind = override.get('type', 'regular' if day.weekday() < 5 and
++                        config.get('weekday_policy') == 'regular' else 'unknown')
++    if kind not in ('regular', 'special', 'unknown'):
++        raise ValueError(f'Invalid session type for {day}')
++    now = now or datetime.now(ZoneInfo('Asia/Kolkata'))
++    complete = (day < now.date() or
++                (day == now.date() and kind == 'regular' and now.time() >= time(15, 30)))
++    # Explicit false always wins; true cannot make a future candle complete.
++    complete = complete and row.get('complete', True) and override.get('complete', True)
++    return {'session_type': kind, 'session_label': override.get('label', kind),
++            'session_source': override.get('source', 'Configured weekday assumption'),
++            'complete': bool(complete)}
++
++
++def volume_context(rows, threshold):
++    config = json.loads(CONFIG.read_text(encoding='utf-8'))
++    last = metadata(rows[-1], config)
++    prior = [r['volume'] for r in rows[:-1]
++             if metadata(r, config)['session_type'] == 'regular' and metadata(r, config)['complete']
++             and r['volume'] > 0][-20:]
++    comparable = last['session_type'] == 'regular' and last['complete'] and len(prior) == 20
++    ratio = rows[-1]['volume'] / (sum(prior) / len(prior)) if comparable else None
++    reason = ('Comparable with 20 complete regular sessions' if comparable else
++              'Special/unknown session, incomplete candle, or fewer than 20 regular sessions')
++    return {**last, 'volume_comparable': comparable, 'volume_confirmed':
++            bool(comparable and ratio >= threshold),
++            'volume_ratio': round(ratio, 2) if ratio is not None else None,
++            'volume_reason': reason, 'volume_baseline_count': len(prior)}
+--- /dev/null
++++ b/backend/sessions.json
+@@ -0,0 +1,10 @@
++{
++  "weekday_policy": "regular",
++  "sessions": {
++    "2026-11-08": {
++      "type": "special",
++      "label": "Muhurat trading",
++      "source": "https://www.nseindia.com/resources/exchange-communication-holidays?apiversion=v2"
++    }
++  }
++}
+--- /dev/null
++++ b/backend/test_scanner.py
+@@ -0,0 +1,105 @@
++import csv
++import tempfile
++import unittest
++from datetime import date, timedelta
++from pathlib import Path
++from unittest.mock import patch
++
++import scanner
++from sessions import volume_context
++
++
++def candles():
++    days = [date(2025, 1, 1) + timedelta(days=i) for i in range(180)]
++    days = [d for d in days if d.weekday() < 5]
++    return [dict(date=d.isoformat(), open=100, high=101, low=99,
++                 close=100, volume=100, complete=True) for d in days]
++
++
++class SessionTests(unittest.TestCase):
++    def test_regular_volume(self):
++        rows = candles()
++        rows[-1]['volume'] = 200
++        v = volume_context(rows, 1.5)
++        self.assertEqual(v['volume_ratio'], 2)
++        self.assertTrue(v['volume_confirmed'])
++
++    def test_special_preserved_and_never_confirmed(self):
++        rows = candles()
++        rows[-1].update(date='2026-11-08', volume=100000)
++        v = volume_context(rows, 1.5)
++        self.assertIsNone(v['volume_ratio'])
++        self.assertFalse(v['volume_confirmed'])
++        result = scanner.evaluate_window(rows[-60:], 1.5, 1)
++        self.assertEqual(result['date'], '2026-11-08')
++        self.assertNotEqual(result['status'], 'Confirmed breakout')
++
++    def test_incomplete_and_unknown(self):
++        for updates in ({'complete': False}, {'date': '2025-06-29'}):
++            rows = candles()
++            rows[-1].update(updates)
++            self.assertFalse(volume_context(rows, 1.5)['volume_comparable'])
++
++    def test_special_excluded_from_baseline(self):
++        rows = candles()
++        rows.insert(-1, dict(rows[-2], date='2026-11-08', volume=100000))
++        self.assertEqual(volume_context(rows, 1.5)['volume_ratio'], 1)
++
++    def test_insufficient_baseline(self):
++        self.assertFalse(volume_context(candles()[:20], 1.5)['volume_comparable'])
++
++    def test_valid_breakout_requires_comparable_volume(self):
++        rows = candles()[-80:]
++        for i, row in enumerate(rows[:-1]):
++            price = 80 + 20 * ((i - 39) / 39) ** 2
++            row.update(open=price, close=price, high=price+1, low=price-1)
++        rows[-1].update(close=106, high=107, volume=200)
++        self.assertEqual(scanner.evaluate_window(rows, 1.5, 1)['status'], 'Confirmed breakout')
++        rows[-1]['date'] = '2026-11-08'
++        result = scanner.evaluate_window(rows, 1.5, 1)
++        self.assertTrue(result['pattern_valid'])
++        self.assertTrue(result['price_breakout'])
++        self.assertFalse(result['volume_confirmed'])
++        self.assertEqual(result['status'], 'Breakout - volume unconfirmed')
++
++    def load_fixture(self, rows):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'TEST.csv'
++            with path.open('w', newline='') as f:
++                writer = csv.DictWriter(f, fieldnames=list(rows[0]))
++                writer.writeheader()
++                writer.writerows(rows)
++            with patch.object(scanner, 'DATA', Path(directory)):
++                return scanner.load_csv('TEST')
++
++    def test_zero_placeholder_excluded(self):
++        rows = candles()[:3]
++        rows[1]['volume'] = 0
++        self.assertEqual(len(self.load_fixture(rows)), 2)
++
++    def test_duplicate_rejected_even_placeholder(self):
++        row = candles()[0]
++        with self.assertRaisesRegex(ValueError, 'Duplicate'):
++            self.load_fixture([row, dict(row, volume=0)])
++
++    def test_signal_candle_excluded_from_shape(self):
++        rows = candles()
++        before = scanner.evaluate_window(rows[-60:], 1.5, 1)
++        rows[-1]['close'] = 200
++        after = scanner.evaluate_window(rows[-60:], 1.5, 1)
++        for key in ('score', 'resistance', 'pattern_bottom', 'depth_pct'):
++            self.assertEqual(before[key], after[key])
++
++    def test_real_files_and_history(self):
++        from main import historical_candles, health
++        result = scanner.scan_all()
++        self.assertEqual(result['errors'], [])
++        self.assertEqual(result['scanned_files'], 9)
++        history = historical_candles('RELIANCE')
++        self.assertFalse(history['synthetic'])
++        self.assertEqual(history['candles'][-1]['session_type'], 'special')
++        self.assertIn('PAPER_ONLY', health()['mode'])
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/frontend/components/PriceChart.tsx
++++ b/frontend/components/PriceChart.tsx
+@@ -1,15 +1,25 @@
+ 'use client';
+ import {useEffect,useRef} from 'react';
+-import {createChart,CandlestickSeries,ColorType,type UTCTimestamp} from 'lightweight-charts';
++import {createChart,CandlestickSeries,ColorType,createSeriesMarkers,LineSeries,type SeriesMarker,type UTCTimestamp} from 'lightweight-charts';
+ type Candle={time:number;open:number;high:number;low:number;close:number};
+-export default function PriceChart({data}:{data:Candle[]}){
++export type Pattern={pattern_start:string;pattern_bottom:string;right_shoulder:string;breakout_date:string|null;resistance:number};
++export default function PriceChart({data,pattern}:{data:Candle[];pattern?:Pattern|null}){
+  const ref=useRef<HTMLDivElement>(null);
+  useEffect(()=>{
+   if(!ref.current||!data.length)return;
+   const chart=createChart(ref.current,{width:ref.current.clientWidth,height:360,layout:{background:{type:ColorType.Solid,color:'#111c2d'},textColor:'#a9b9d0'},grid:{vertLines:{color:'#1d2c42'},horzLines:{color:'#1d2c42'}},timeScale:{timeVisible:true}});
+   const series=chart.addSeries(CandlestickSeries,{upColor:'#25c59a',downColor:'#f26b79',borderVisible:false,wickUpColor:'#25c59a',wickDownColor:'#f26b79'});
+-  series.setData(data.map(x=>({...x,time:x.time as UTCTimestamp})));chart.timeScale().fitContent();
++  series.setData(data.map(x=>({...x,time:x.time as UTCTimestamp})));
++  if(pattern){
++   const timestamp=(date:string)=>Math.floor(Date.parse(date+'T00:00:00Z')/1000) as UTCTimestamp;
++   const points=[{date:pattern.pattern_start,text:'Pattern start'},{date:pattern.pattern_bottom,text:'Trough'},{date:pattern.right_shoulder,text:'Right shoulder'},...(pattern.breakout_date?[{date:pattern.breakout_date,text:'Price breakout'}]:[])];
++   const markers:SeriesMarker<UTCTimestamp>[]=points.sort((a,b)=>a.date.localeCompare(b.date)).filter(p=>data.some(c=>c.time===timestamp(p.date))).map(p=>({time:timestamp(p.date),position:'aboveBar',shape:'arrowDown',color:'#fbbf24',text:p.text}));
++   createSeriesMarkers(series,markers);
++   const neckline=chart.addSeries(LineSeries,{color:'#fbbf24',lineWidth:2,priceLineVisible:false,lastValueVisible:false});
++   neckline.setData([{time:timestamp(pattern.pattern_start),value:pattern.resistance},{time:data[data.length-1].time as UTCTimestamp,value:pattern.resistance}]);
++  }
++  chart.timeScale().fitContent();
+   const observer=new ResizeObserver(()=>{if(ref.current)chart.applyOptions({width:ref.current.clientWidth})});observer.observe(ref.current);
+   return ()=>{observer.disconnect();chart.remove()};
+- },[data]);return <div ref={ref} className="w-full"/>;
++ },[data,pattern]);return <div ref={ref} className="w-full"/>;
+ }
+--- a/frontend/components/HistoricalScanner.tsx
++++ b/frontend/components/HistoricalScanner.tsx
+@@ -1,13 +1,31 @@
+ 'use client';
+-import {useState} from 'react';
+-import {api} from '../lib/api';
+-type Result={symbol:string;status:string;score:number;close:number;resistance:number;volume_ratio:number;distance_pct:number;date:string};
+-type Scan={source:string;scanned_files:number;signals:Result[];errors:{file:string;error:string}[]};
++import {useEffect,useRef,useState} from 'react';
++import dynamic from 'next/dynamic';
++import {api,type Candle} from '../lib/api';
++import type {Pattern} from './PriceChart';
++const PriceChart=dynamic(()=>import('./PriceChart'),{ssr:false});
++type Result=Pattern&{symbol:string;status:string;score:number;close:number;volume_ratio:number|null;volume_comparable:boolean;volume_confirmed:boolean;volume_reason:string;session_label:string;date:string;pattern_valid:boolean;price_breakout:boolean;breakout_recent:boolean};
++type Scan={source:string;scanned_files:number;symbols:string[];signals:Result[];errors:{file:string;error:string}[]};
++type History={symbol:string;candles:({date:string;session_label:string;complete:boolean}&Omit<Candle,'time'>)[];pattern:Result|null};
+ export default function HistoricalScanner(){
+  const [lookback,setLookback]=useState(120),[vol,setVol]=useState(1.5),[buffer,setBuffer]=useState(1),[data,setData]=useState<Scan|null>(null),[error,setError]=useState(''),[busy,setBusy]=useState(false);
+- async function scan(){setBusy(true);setError('');try{setData(await api<Scan>(`/api/scanner/rounding-bottom?lookback=${lookback}&volume_ratio=${vol}&breakout_pct=${buffer}`))}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
+- return <section className="panel overflow-x-auto"><h2 className="text-xl font-semibold mb-2">Historical CSV Rounding-Bottom Scanner</h2><p className="muted text-sm mb-4">Actual calculations on your supplied daily OHLCV CSV files. Separate from the simulated Phase 1 chart and paper fills.</p>
+- <div className="flex flex-wrap gap-3 items-end mb-4"><label className="text-sm">Lookback days<br/><input className="text-black p-2 rounded w-28" type="number" min="60" max="250" value={lookback} onChange={e=>setLookback(Number(e.target.value))}/></label><label className="text-sm">Volume multiplier<br/><input className="text-black p-2 rounded w-28" type="number" step="0.1" min="1" max="5" value={vol} onChange={e=>setVol(Number(e.target.value))}/></label><label className="text-sm">Breakout buffer %<br/><input className="text-black p-2 rounded w-28" type="number" step="0.5" min="0" max="5" value={buffer} onChange={e=>setBuffer(Number(e.target.value))}/></label><button className="tag cursor-pointer" disabled={busy} onClick={()=>void scan()}>{busy?'Scanning…':'Scan CSV files'}</button></div>
+- {error&&<p className="text-rose-300">{error}</p>}{data&&<><p className="muted text-sm mb-3">{data.scanned_files} files checked · {data.signals.length} qualifying patterns · {data.errors.length} file errors</p><table><thead><tr><th>Symbol</th><th>Status</th><th>Score</th><th>Close</th><th>Resistance</th><th>Relative volume</th></tr></thead><tbody>{data.signals.map(s=><tr key={s.symbol}><td>{s.symbol}</td><td>{s.status}</td><td>{s.score}</td><td>₹{s.close}</td><td>₹{s.resistance}</td><td>{s.volume_ratio}×</td></tr>)}</tbody></table>{data.signals.length===0&&<p className="muted text-sm py-3">No qualifying patterns. Add CSV files to backend/data or adjust the scanner settings.</p>}{data.errors.map(e=><p key={e.file} className="text-rose-300 text-sm">{e.file}: {e.error}</p>)}</>}
++ const [selected,setSelected]=useState(''),[history,setHistory]=useState<History|null>(null),[chartError,setChartError]=useState('');
++ const request=useRef(0);
++ const [settings,setSettings]=useState({lookback:120,vol:1.5,buffer:1});
++ async function scan(){setBusy(true);setError('');try{const result=await api<Scan>(`/api/scanner/rounding-bottom?lookback=${lookback}&volume_ratio=${vol}&breakout_pct=${buffer}`);setData(result);setSettings({lookback,vol,buffer});setSelected(s=>result.symbols.includes(s)?s:result.signals[0]?.symbol||result.symbols[0]||'')}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
++ useEffect(()=>{
++  if(!selected)return;
++  const id=++request.current;let active=true;setHistory(null);setChartError('');
++  api<History>(`/api/history/${selected}?lookback=${settings.lookback}&volume_ratio=${settings.vol}&breakout_pct=${settings.buffer}`).then(h=>{if(active&&id===request.current)setHistory(h)}).catch(e=>{if(active)setChartError(e.message)});
++  return ()=>{active=false};
++ },[selected,settings]);
++ const pattern=history?.pattern;
++ return <section className="panel min-w-0"><h2 className="text-xl font-semibold mb-2">Historical CSV Rounding-Bottom Scanner</h2><p className="muted text-sm mb-4">Supplied daily OHLCV candles. Heuristic shape scores are not success probabilities. Historical chart selections do not change simulated paper fills.</p>
++ <div className="flex flex-wrap gap-3 items-end mb-4"><label className="text-sm">Lookback sessions<br/><input className="field !w-28" type="number" min="60" max="250" value={lookback} onChange={e=>setLookback(Number(e.target.value))}/></label><label className="text-sm">Volume multiplier<br/><input className="field !w-28" type="number" step="0.1" min="1" max="5" value={vol} onChange={e=>setVol(Number(e.target.value))}/></label><label className="text-sm">Breakout buffer %<br/><input className="field !w-28" type="number" step="0.5" min="0" max="5" value={buffer} onChange={e=>setBuffer(Number(e.target.value))}/></label><button className="btn" disabled={busy} onClick={()=>void scan()}>{busy?'Scanning…':'Scan CSV files'}</button></div>
++ {error&&<p role="alert" className="text-rose-300">{error}</p>}{data&&<><p className="muted text-sm mb-3">{data.scanned_files} files checked · {data.signals.length} qualifying patterns · {data.errors.length} file errors</p><div className="overflow-x-auto"><table><thead><tr><th>Symbol</th><th>Status</th><th>Shape score</th><th>Close</th><th>Resistance</th><th>Relative volume</th></tr></thead><tbody>{data.signals.map(s=><tr key={s.symbol}><td><button className="text-blue-300 underline" onClick={()=>setSelected(s.symbol)}>{s.symbol}</button></td><td>{s.status}</td><td>{s.score}/100</td><td>₹{s.close}</td><td>₹{s.resistance}</td><td title={s.volume_reason}>{s.volume_ratio===null?'N/A · '+s.session_label:s.volume_ratio+'×'}{!s.volume_comparable&&' · incomparable'}</td></tr>)}</tbody></table></div>{data.signals.length===0&&<p className="muted text-sm py-3">No qualifying patterns at these settings. You can still inspect each CSV below.</p>}{data.errors.map(e=><p key={e.file} className="text-rose-300 text-sm">{e.file}: {e.error}</p>)}
++ <label className="block mt-5 mb-3">Historical daily chart <select aria-label="Historical symbol" className="field !w-auto ml-3" value={selected} onChange={e=>setSelected(e.target.value)}>{data.symbols.map(s=><option key={s}>{s}</option>)}</select></label>
++ {chartError&&<p role="alert" className="text-rose-300">{chartError}</p>}{selected&&!history&&!chartError&&<p>Loading candles…</p>}
++ {history&&<><p className="muted text-sm">{history.symbol} · User-provided CSV · Daily · Through {history.candles.at(-1)?.date} · {history.candles.at(-1)?.session_label}</p><PriceChart data={history.candles.map(c=>({...c,time:Date.parse(c.date+'T00:00:00Z')/1000}))} pattern={pattern}/>{pattern?<><p className="text-sm">{pattern.status} · Shape {pattern.score}/100 · Resistance ₹{pattern.resistance} · Price above buffered resistance: {pattern.price_breakout?'yes':'no'} · Recent crossing: {pattern.breakout_recent?'yes':'no'}</p><p className="muted text-sm">Volume: {pattern.volume_ratio===null?'N/A':pattern.volume_ratio+'×'} · {pattern.volume_reason} · Confirmed: {pattern.volume_confirmed?'yes':'no'}</p><p className="muted text-xs mt-2">Gold annotations: pattern start, trough, right shoulder, historical neckline, and price crossing when present. Crossings do not imply confirmed volume.</p></>:<p className="muted text-sm">No qualifying rounding-bottom pattern; no pattern annotations shown.</p>}</>}
++ </>}
+  </section>;
+ }
+--- a/frontend/app/page.tsx
++++ b/frontend/app/page.tsx
+@@ -16,13 +16,13 @@
+  async function reset(){if(!window.confirm('Reset all simulated cash, positions and orders?'))return;await api('/api/paper/reset',{method:'POST'});setNotice('Paper account reset');await refresh()}
+  const price=stocks.find(s=>s.symbol===selected)?.price||0;
+  return <main className="max-w-[1500px] mx-auto p-4 md:p-7 space-y-5">
+- <header className="flex flex-wrap gap-3 justify-between items-center"><div><h1 className="text-3xl font-bold tracking-tight">Trade<span className="text-blue-400">Edge</span></h1><p className="muted text-sm mt-1">Indian equities · Multi-timeframe strategy dashboard</p></div><div className="flex items-center gap-3"><span className="tag">SIMULATED DATA</span><span className="tag">PAPER ONLY</span><button onClick={()=>void refresh()} className="btn flex items-center gap-2"><RefreshCcw size={15}/> Refresh</button></div></header>
++ <header className="flex flex-wrap gap-3 justify-between items-center"><div><h1 className="text-3xl font-bold tracking-tight">Trade<span className="text-blue-400">Edge</span></h1><p className="muted text-sm mt-1">Indian equities · Multi-timeframe strategy dashboard</p></div><div className="flex items-center gap-3"><span className="tag">CSV RESEARCH + DEMO</span><span className="tag">PAPER ONLY</span><button onClick={()=>void refresh()} className="btn flex items-center gap-2"><RefreshCcw size={15}/> Refresh</button></div></header>
+  {error&&<div role="alert" className="bg-red-950 border border-red-700 p-3 rounded-lg text-red-200">{error} — Check backend at 127.0.0.1:8000</div>}
+  {notice&&<div role="status" className="bg-emerald-950 border border-emerald-700 p-3 rounded-lg text-emerald-200">{notice}</div>}
+- <div className="grid grid-cols-1 md:grid-cols-3 gap-4">{[{label:'Paper Equity',value:money(account?.equity||0),icon:<Wallet size={20}/>},{label:'Available Cash',value:money(account?.cash||0),icon:<ShieldCheck size={20}/>},{label:'Scanner Results',value:String(signals.length),icon:<Activity size={20}/>}].map(x=><div key={x.label} className="panel"><div className="flex justify-between muted text-sm">{x.label}{x.icon}</div><div className="text-3xl font-semibold mt-3">{x.value}</div></div>)}</div>
++ <HistoricalScanner/><div className="grid grid-cols-1 md:grid-cols-3 gap-4">{[{label:'Paper Equity',value:money(account?.equity||0),icon:<Wallet size={20}/>},{label:'Available Cash',value:money(account?.cash||0),icon:<ShieldCheck size={20}/>},{label:'Demo Scanner Results',value:String(signals.length),icon:<Activity size={20}/>}].map(x=><div key={x.label} className="panel"><div className="flex justify-between muted text-sm">{x.label}{x.icon}</div><div className="text-3xl font-semibold mt-3">{x.value}</div></div>)}</div>
+  <div className="flex flex-wrap gap-2 items-center"><span className="muted text-sm mr-2">Trading style</span>{(['intraday','swing','positional'] as Style[]).map(x=><button key={x} className={`tab ${style===x?'active':'bg-[#16233a]'}`} onClick={()=>setStyle(x)}>{x[0].toUpperCase()+x.slice(1)} ({frames[x]})</button>)}</div>
+  <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,2fr)_minmax(290px,1fr)] gap-4"><section className="panel min-w-0"><div className="flex flex-wrap justify-between items-center gap-3 mb-4"><div><h2 className="text-xl font-semibold">{selected} <span className="text-blue-300">{money(price)}</span></h2><p className="muted text-xs">Synthetic candles · {frames[style]} · Not live NSE prices</p></div><select aria-label="Select stock" className="field !w-auto" value={selected} onChange={e=>setSelected(e.target.value)}>{stocks.map(s=><option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}</select></div><PriceChart data={candles}/></section>
+  <section className="panel"><h2 className="text-xl font-semibold mb-2">Paper Order</h2><p className="muted text-sm mb-5">Simulated market fill at demo price. No broker connection.</p><label className="block muted text-sm mb-2">Symbol</label><select className="field mb-4" value={selected} onChange={e=>setSelected(e.target.value)}>{stocks.map(s=><option key={s.symbol}>{s.symbol}</option>)}</select><label className="block muted text-sm mb-2">Side</label><div className="flex gap-2 mb-4">{(['BUY','SELL'] as const).map(x=><button key={x} onClick={()=>setSide(x)} className={`flex-1 py-2 rounded-lg ${side===x?(x==='BUY'?'bg-emerald-600':'bg-rose-600'):'bg-[#24344c]'}`}>{x}</button>)}</div><label className="block muted text-sm mb-2">Quantity</label><input aria-label="Quantity" className="field mb-4" type="number" min="1" step="1" value={qty} onChange={e=>setQty(Number(e.target.value))}/><div className="flex justify-between text-sm mb-5"><span className="muted">Estimated notional</span><strong>{money(price*qty)}</strong></div><button disabled={loading||!Number.isInteger(qty)||qty<=0} onClick={()=>void submit()} className="btn w-full">{loading?'Processing...':`Place ${side} Paper Order`}</button><p className="muted text-xs mt-4">Orders and cash are held in backend memory and reset when the backend restarts.</p></section></div>
+- <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,2fr)_minmax(290px,1fr)] gap-4"><section className="panel overflow-x-auto"><div className="flex justify-between items-center mb-4"><h2 className="text-xl font-semibold flex items-center gap-2"><BarChart3 size={19}/> Pattern Scanner</h2><span className="tag">DEMO SIGNALS — NOT DETECTED</span></div><table><thead><tr><th>Stock</th><th>Setup</th><th>Price</th><th>Status</th><th>Score</th></tr></thead><tbody>{signals.map(s=><tr key={s.symbol} className="hover:bg-[#1b2b43] cursor-pointer" onClick={()=>setSelected(s.symbol)}><td className="font-semibold text-blue-300">{s.symbol}</td><td>{s.pattern}</td><td>{money(s.price)}</td><td><span className="tag">{s.status}</span></td><td>{s.score}/100</td></tr>)}</tbody></table></section><section className="panel"><div className="flex justify-between items-center mb-4"><h2 className="text-xl font-semibold">Paper Portfolio</h2><button className="text-xs text-rose-300 underline" onClick={()=>void reset()}>Reset account</button></div><h3 className="muted text-sm mb-2">Holdings</h3>{account?.holdings.length?account.holdings.map(h=><div key={h.symbol} className="flex justify-between border-b border-[#26364e] py-3 text-sm"><span>{h.symbol} × {h.quantity}</span><strong>{money(h.quantity*h.price)}</strong></div>):<p className="muted text-sm mb-5">No holdings yet.</p>}<h3 className="muted text-sm mt-5 mb-2">Recent orders</h3>{account?.orders.length?account.orders.slice(0,6).map(o=><div key={o.id} className="border-b border-[#26364e] py-2 text-xs"><strong className={o.side==='BUY'?'text-emerald-300':'text-rose-300'}>{o.side}</strong> {o.quantity} {o.symbol} @ {money(o.price)}</div>):<p className="muted text-sm">No orders yet.</p>}</section></div>
+- <HistoricalScanner/><footer className="muted text-xs pb-6">TradeEdge Phase 1 · All prices, scanner scores and fills are deterministic demonstrations. Not investment advice. No live order routing.</footer></main>
++ <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,2fr)_minmax(290px,1fr)] gap-4"><section className="panel overflow-x-auto"><div className="flex justify-between items-center mb-4"><h2 className="text-xl font-semibold flex items-center gap-2"><BarChart3 size={19}/> Demo Pattern Scanner</h2><span className="tag">DEMO SIGNALS — NOT DETECTED</span></div><table><thead><tr><th>Stock</th><th>Setup</th><th>Price</th><th>Status</th><th>Score</th></tr></thead><tbody>{signals.map(s=><tr key={s.symbol} className="hover:bg-[#1b2b43] cursor-pointer" onClick={()=>setSelected(s.symbol)}><td className="font-semibold text-blue-300">{s.symbol}</td><td>{s.pattern}</td><td>{money(s.price)}</td><td><span className="tag">{s.status}</span></td><td>{s.score}/100</td></tr>)}</tbody></table></section><section className="panel"><div className="flex justify-between items-center mb-4"><h2 className="text-xl font-semibold">Paper Portfolio</h2><button className="text-xs text-rose-300 underline" onClick={()=>void reset()}>Reset account</button></div><h3 className="muted text-sm mb-2">Holdings</h3>{account?.holdings.length?account.holdings.map(h=><div key={h.symbol} className="flex justify-between border-b border-[#26364e] py-3 text-sm"><span>{h.symbol} × {h.quantity}</span><strong>{money(h.quantity*h.price)}</strong></div>):<p className="muted text-sm mb-5">No holdings yet.</p>}<h3 className="muted text-sm mt-5 mb-2">Recent orders</h3>{account?.orders.length?account.orders.slice(0,6).map(o=><div key={o.id} className="border-b border-[#26364e] py-2 text-xs"><strong className={o.side==='BUY'?'text-emerald-300':'text-rose-300'}>{o.side}</strong> {o.quantity} {o.symbol} @ {money(o.price)}</div>):<p className="muted text-sm">No orders yet.</p>}</section></div>
++ <footer className="muted text-xs pb-6">TradeEdge Phase 2 · Historical CSV research above; Phase 1 charts, demo scanner and paper fills below use simulated prices. Not investment advice. No live order routing.</footer></main>
+ }
+--- /dev/null
++++ b/DEVELOPMENT.md
+@@ -0,0 +1,76 @@
++# Phase 2 continuation
++
++The implementation was copied from `F:\tradeedge-phase2` into this writable workspace,
++`F:\tradeedge-codex`. The original directory is unchanged. Start both servers from
++this workspace to use these changes; stop older instances on ports 3000/8000 first.
++
++## Windows commands
++
++Backend setup and start (PowerShell, from project root):
++
++```powershell
++python -m venv backend\.venv
++backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
++backend\.venv\Scripts\python.exe -m unittest discover -s backend -v
++cd backend
++.\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
++```
++
++Frontend (separate terminal):
++
++```powershell
++cd F:\tradeedge-codex\frontend
++npm.cmd ci
++npm.cmd run build
++npm.cmd run dev
++```
++
++## Changes and contracts
++
++- `backend/sessions.json` supplies exchange-wide date overrides. NSE's calendar
++  confirms 2026-11-08 Muhurat trading; the source URL is stored with that entry.
++  No duration normalization or exact session hours are assumed.
++- Weekday CSV candles are **assumed** regular by configuration, not checked against
++  a complete exchange calendar. Unlisted weekends are unknown. Set
++  `weekday_policy` to `unknown` for conservative operation and explicitly list
++  verified regular sessions. Add special-session overrides as the calendar changes.
++- Optional CSV `complete=false` excludes a candle from volume comparison.
++  Future dates and today's regular candle before 15:30 India time are incomplete.
++  Special sessions are incomparable regardless of completeness.
++- `volume_ratio` is now nullable. `volume_comparable`, `volume_confirmed`,
++  `volume_reason`, `volume_baseline_count`, session metadata and `complete` explain
++  the result. The baseline uses the preceding 20 complete regular candles,
++  excluding special/unknown/incomplete candles. No low-participation inference is
++  made from incomparable volume. Zero-volume placeholders are excluded; duplicate
++  dates (including placeholder duplicates) remain file errors.
++- Pattern validity, price above buffered resistance, recent crossing and current
++  volume confirmation are independent fields. A confirmed breakout also requires
++  comparable confirming volume on its crossing candle and a crossing within five
++  observations. Volume uses the unrounded ratio for decisions.
++- Resistance uses left-shoulder historical highs. Pattern fitting excludes the
++  signal candle, including from smoothing. These remain experimental heuristics.
++- `GET /api/history/{symbol}` returns daily CSV candles and the same candidate
++  used by the scanner. It accepts the scanner's lookback, volume_ratio and
++  breakout_pct settings. Missing files return 404, malformed input/data 400.
++- The historical scanner has its own selectable chart, neckline and date markers
++  for start, trough, right shoulder and price crossing. No qualifying candidate
++  means candles without pattern overlays. It is shown above clearly labeled demo
++  components. Existing demo APIs, simulated fills and in-memory account remain.
++
++## Validation and limitations
++
++Unit tests cover regular/special/unknown/incomplete volume, baseline filtering,
++zero-volume placeholders, duplicates, signal-candle leakage and real CSV loading.
++All nine supplied CSV files scan without errors. No broker integration was added.
++
++Validation: 10 backend tests, TypeScript checking, and the webpack production build
++pass. Browser interaction/visual QA has not been run. Turbopack fails locally
++while starting its CSS worker, including outside the sandbox; use
++`npm.cmd run build -- --webpack` to run the alternative production build.
++
++Daily CSV history is user supplied, not a live feed or independently verified market
++data. Scores are shape heuristics, not probabilities. This is not a backtester;
++historical annotations fitted as of the last candle must not be treated as signals
++known at their earlier marker dates. Intraday feeds, a full verified calendar,
++rejected-pattern diagnostics, backtesting and deployment dependency review remain
++future work.
