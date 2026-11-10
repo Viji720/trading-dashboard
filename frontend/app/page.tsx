@@ -1,28 +1,22 @@
-'use client';
-import {useCallback,useEffect,useState} from 'react';
-import dynamic from 'next/dynamic';
-import HistoricalScanner from '../components/HistoricalScanner';
-import {Activity,BarChart3,Wallet,RefreshCcw,ShieldCheck} from 'lucide-react';
-import {api,type Stock,type Candle,type Signal,type Account} from '../lib/api';
-const PriceChart=dynamic(()=>import('../components/PriceChart'),{ssr:false});
-type Style='intraday'|'swing'|'positional';
-const frames:Record<Style,string>={intraday:'15m',swing:'1d',positional:'1w'};
-const money=(n:number)=>'₹'+n.toLocaleString('en-IN',{maximumFractionDigits:2});
-export default function Home(){
- const [stocks,setStocks]=useState<Stock[]>([]),[selected,setSelected]=useState('RELIANCE'),[style,setStyle]=useState<Style>('swing'),[candles,setCandles]=useState<Candle[]>([]),[signals,setSignals]=useState<Signal[]>([]),[account,setAccount]=useState<Account|null>(null),[qty,setQty]=useState(1),[side,setSide]=useState<'BUY'|'SELL'>('BUY'),[error,setError]=useState(''),[notice,setNotice]=useState(''),[loading,setLoading]=useState(false);
- const refresh=useCallback(async()=>{try{const [s,a,sg,c]=await Promise.all([api<Stock[]>('/api/stocks'),api<Account>('/api/paper/account'),api<{signals:Signal[]}>(`/api/signals?style=${style}`),api<{candles:Candle[]}>(`/api/candles/${selected}?timeframe=${frames[style]}`)]);setStocks(s);setAccount(a);setSignals(sg.signals);setCandles(c.candles);setError('')}catch(e){setError((e as Error).message)}},[selected,style]);
- useEffect(()=>{void refresh()},[refresh]);
- async function submit(){setLoading(true);setError('');setNotice('');try{const order=await api<{quantity:number;symbol:string;side:string;price:number}>('/api/paper/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:selected,side,quantity:qty})});setNotice(`Simulated ${order.side} filled: ${order.quantity} ${order.symbol} @ ${money(order.price)}`);await refresh()}catch(e){setError((e as Error).message)}finally{setLoading(false)}}
- async function reset(){if(!window.confirm('Reset all simulated cash, positions and orders?'))return;await api('/api/paper/reset',{method:'POST'});setNotice('Paper account reset');await refresh()}
- const price=stocks.find(s=>s.symbol===selected)?.price||0;
- return <main className="max-w-[1500px] mx-auto p-4 md:p-7 space-y-5">
- <header className="flex flex-wrap gap-3 justify-between items-center"><div><h1 className="text-3xl font-bold tracking-tight">Trade<span className="text-blue-400">Edge</span></h1><p className="muted text-sm mt-1">Indian equities · Multi-timeframe strategy dashboard</p></div><div className="flex items-center gap-3"><span className="tag">CSV RESEARCH + DEMO</span><span className="tag">PAPER ONLY</span><button onClick={()=>void refresh()} className="btn flex items-center gap-2"><RefreshCcw size={15}/> Refresh</button></div></header>
- {error&&<div role="alert" className="bg-red-950 border border-red-700 p-3 rounded-lg text-red-200">{error} — Unable to connect to TradeEdge API</div>}
- {notice&&<div role="status" className="bg-emerald-950 border border-emerald-700 p-3 rounded-lg text-emerald-200">{notice}</div>}
- <HistoricalScanner/><div className="grid grid-cols-1 md:grid-cols-3 gap-4">{[{label:'Paper Equity',value:money(account?.equity||0),icon:<Wallet size={20}/>},{label:'Available Cash',value:money(account?.cash||0),icon:<ShieldCheck size={20}/>},{label:'Demo Scanner Results',value:String(signals.length),icon:<Activity size={20}/>}].map(x=><div key={x.label} className="panel"><div className="flex justify-between muted text-sm">{x.label}{x.icon}</div><div className="text-3xl font-semibold mt-3">{x.value}</div></div>)}</div>
- <div className="flex flex-wrap gap-2 items-center"><span className="muted text-sm mr-2">Trading style</span>{(['intraday','swing','positional'] as Style[]).map(x=><button key={x} className={`tab ${style===x?'active':'bg-[#16233a]'}`} onClick={()=>setStyle(x)}>{x[0].toUpperCase()+x.slice(1)} ({frames[x]})</button>)}</div>
- <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,2fr)_minmax(290px,1fr)] gap-4"><section className="panel min-w-0"><div className="flex flex-wrap justify-between items-center gap-3 mb-4"><div><h2 className="text-xl font-semibold">{selected} <span className="text-blue-300">{money(price)}</span></h2><p className="muted text-xs">Synthetic candles · {frames[style]} · Not live NSE prices</p></div><select aria-label="Select stock" className="field !w-auto" value={selected} onChange={e=>setSelected(e.target.value)}>{stocks.map(s=><option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}</select></div><PriceChart data={candles}/></section>
- <section className="panel"><h2 className="text-xl font-semibold mb-2">Paper Order</h2><p className="muted text-sm mb-5">Simulated market fill at demo price. No broker connection.</p><label className="block muted text-sm mb-2">Symbol</label><select className="field mb-4" value={selected} onChange={e=>setSelected(e.target.value)}>{stocks.map(s=><option key={s.symbol}>{s.symbol}</option>)}</select><label className="block muted text-sm mb-2">Side</label><div className="flex gap-2 mb-4">{(['BUY','SELL'] as const).map(x=><button key={x} onClick={()=>setSide(x)} className={`flex-1 py-2 rounded-lg ${side===x?(x==='BUY'?'bg-emerald-600':'bg-rose-600'):'bg-[#24344c]'}`}>{x}</button>)}</div><label className="block muted text-sm mb-2">Quantity</label><input aria-label="Quantity" className="field mb-4" type="number" min="1" step="1" value={qty} onChange={e=>setQty(Number(e.target.value))}/><div className="flex justify-between text-sm mb-5"><span className="muted">Estimated notional</span><strong>{money(price*qty)}</strong></div><button disabled={loading||!Number.isInteger(qty)||qty<=0} onClick={()=>void submit()} className="btn w-full">{loading?'Processing...':`Place ${side} Paper Order`}</button><p className="muted text-xs mt-4">Orders and cash are held in backend memory and reset when the backend restarts.</p></section></div>
- <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,2fr)_minmax(290px,1fr)] gap-4"><section className="panel overflow-x-auto"><div className="flex justify-between items-center mb-4"><h2 className="text-xl font-semibold flex items-center gap-2"><BarChart3 size={19}/> Demo Pattern Scanner</h2><span className="tag">DEMO SIGNALS — NOT DETECTED</span></div><table><thead><tr><th>Stock</th><th>Setup</th><th>Price</th><th>Status</th><th>Score</th></tr></thead><tbody>{signals.map(s=><tr key={s.symbol} className="hover:bg-[#1b2b43] cursor-pointer" onClick={()=>setSelected(s.symbol)}><td className="font-semibold text-blue-300">{s.symbol}</td><td>{s.pattern}</td><td>{money(s.price)}</td><td><span className="tag">{s.status}</span></td><td>{s.score}/100</td></tr>)}</tbody></table></section><section className="panel"><div className="flex justify-between items-center mb-4"><h2 className="text-xl font-semibold">Paper Portfolio</h2><button className="text-xs text-rose-300 underline" onClick={()=>void reset()}>Reset account</button></div><h3 className="muted text-sm mb-2">Holdings</h3>{account?.holdings.length?account.holdings.map(h=><div key={h.symbol} className="flex justify-between border-b border-[#26364e] py-3 text-sm"><span>{h.symbol} × {h.quantity}</span><strong>{money(h.quantity*h.price)}</strong></div>):<p className="muted text-sm mb-5">No holdings yet.</p>}<h3 className="muted text-sm mt-5 mb-2">Recent orders</h3>{account?.orders.length?account.orders.slice(0,6).map(o=><div key={o.id} className="border-b border-[#26364e] py-2 text-xs"><strong className={o.side==='BUY'?'text-emerald-300':'text-rose-300'}>{o.side}</strong> {o.quantity} {o.symbol} @ {money(o.price)}</div>):<p className="muted text-sm">No orders yet.</p>}</section></div>
- <footer className="muted text-xs pb-6">TradeEdge Phase 2 · Historical CSV research above; Phase 1 charts, demo scanner and paper fills below use simulated prices. Not investment advice. No live order routing.</footer></main>
+import Link from 'next/link';
+import MarketOverview from '../components/MarketOverview';
+
+export default function Home() {
+  return (
+    <main className="mx-auto max-w-6xl px-6 py-10">
+      <p className="text-sm font-medium uppercase tracking-widest text-cyan-300">TradeEdge Research</p>
+      <h1 className="mt-3 text-4xl font-semibold text-slate-100">Indian F&amp;O Intelligence</h1>
+      <MarketOverview />
+      <div className="mt-8 grid gap-4 sm:grid-cols-2">
+        <Link className="rounded-xl border border-slate-700 bg-slate-900 p-5 hover:border-cyan-400" href="/strategies">
+          <h2 className="font-semibold">Daily Strategy Scans</h2>
+          <p className="mt-2 text-sm text-slate-300">Find setups in completed daily candles.</p>
+        </Link>
+        <Link className="rounded-xl border border-slate-700 bg-slate-900 p-5 hover:border-cyan-400" href="/paper-trading">
+          <h2 className="font-semibold">Paper Trading &amp; Historical Scanner</h2>
+          <p className="mt-2 text-sm text-slate-300">Scan CSV history and place simulated orders.</p>
+        </Link>
+      </div>
+    </main>
+  );
 }

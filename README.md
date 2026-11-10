@@ -41,3 +41,19 @@ If `py -3` is unavailable, use `python` to create the venv instead.
 - State is in Python memory; restart backend to reset orders and cash.
 - Do not expose the API to the internet. It has no authentication.
 - Future phases: PostgreSQL persistence, licensed data ingestion, pattern detection, backtesting, broker adapters, and security.
+
+## Refresh daily NSE F&O stock history
+
+From the project root, install the downloader dependencies and run the refresh:
+
+```powershell
+python -m pip install -r backend/requirements-download.txt
+python backend/download_stocks.py
+```
+
+The refresh discovers current NSE stock derivatives underlyings from the public
+Upstox instrument master and downloads two years of daily cash-equity candles
+from Yahoo Finance. It skips the current India calendar day and reports failed
+symbols. Successful downloads replace the corresponding SYMBOL.csv atomically.
+Original NSE export files remain in place. The scanner prefers SYMBOL.csv if
+both forms exist. Refresh the historical scanner to see the updated data.

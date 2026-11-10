@@ -112,3 +112,13 @@ def historical_candles(symbol: str, lookback: int = 120, volume_ratio: float = 1
         raise HTTPException(404, 'No historical CSV for symbol')
     except (ValueError, KeyError) as exc:
         raise HTTPException(400, str(exc))
+
+from strategies import router as strategy_router
+from upstox import router as upstox_router
+
+app.include_router(strategy_router)
+app.include_router(upstox_router)
+
+from history_download import router as history_download_router
+
+app.include_router(history_download_router)

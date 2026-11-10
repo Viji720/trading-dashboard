@@ -2,6 +2,7 @@
 """TradeEdge rounding-bottom research scanner."""
 
 import csv
+import re
 from pathlib import Path
 from datetime import datetime
 from statistics import mean
@@ -12,29 +13,62 @@ from sessions import volume_context
 DATA = Path(__file__).parent / "data"
 
 
+NSE_QUOTE = re.compile(
+    r"Quote-Equity-([A-Z0-9][A-Z0-9&-]{0,19})-EQ-\d{2}-\d{2}-\d{4}-\d{2}-\d{2}-\d{4}",
+    re.IGNORECASE,
+)
+
+
+def valid_symbol(symbol):
+    return re.fullmatch(r'[A-Z0-9][A-Z0-9&-]{0,19}', symbol, re.IGNORECASE | re.ASCII) is not None
+
+
+def file_symbol(path):
+    match = NSE_QUOTE.fullmatch(path.stem)
+    if match:
+        return match[1].upper()
+    if valid_symbol(path.stem):
+        return path.stem.upper()
+    raise ValueError("Invalid symbol")
+
+
 def load_csv(symbol):
-    if not symbol.isalnum() or len(symbol) > 20:
+    if not valid_symbol(symbol):
         raise ValueError("Invalid symbol")
 
-    path = DATA / f"{symbol.upper()}.csv"
-    if not path.exists():
-        raise FileNotFoundError(path.name)
+    symbol = symbol.upper()
+    path = DATA / f"{symbol}.csv"
+    if not path.is_file():
+        matches = [
+            file for file in DATA.glob("*.csv")
+            if NSE_QUOTE.fullmatch(file.stem) and file_symbol(file) == symbol
+        ]
+        if not matches:
+            raise FileNotFoundError(path.name)
+        if len(matches) > 1:
+            raise ValueError(f"Multiple NSE exports for {symbol}")
+        path = matches[0]
 
+    return read_csv(path)
+
+
+def read_csv(path):
+    nse_quote = NSE_QUOTE.fullmatch(path.stem) is not None
+    date_format = "%d-%b-%Y" if nse_quote else "%Y-%m-%d"
     rows = []
     seen = set()
 
     with path.open(newline="", encoding="utf-8-sig") as f:
         for raw in csv.DictReader(f):
-            day = datetime.strptime(
-                raw["date"].strip(), "%Y-%m-%d"
-            ).date()
+            raw = {key.strip().lower(): value for key, value in raw.items() if key}
+            day = datetime.strptime(raw["date"].strip(), date_format).date()
 
             if day in seen:
                 raise ValueError("Duplicate dates")
             seen.add(day)
 
             v = {
-                k: float(raw[k])
+                k: float(raw[k].replace(",", "") if nse_quote else raw[k])
                 for k in ("open", "high", "low", "close", "volume")
             }
 
@@ -318,9 +352,14 @@ def scan_all(lookback=120,
 
     files = sorted(DATA.glob("*.csv"))
 
+    symbols = set()
     for file in files:
         try:
-            rows = load_csv(file.stem)
+            symbol = file_symbol(file)
+            if symbol in symbols:
+                continue
+            rows = load_csv(symbol)
+            symbols.add(symbol)
 
             result = detect(
                 rows, lookback,
@@ -329,7 +368,7 @@ def scan_all(lookback=120,
 
             if result:
                 signals.append({
-                    "symbol": file.stem.upper(),
+                    "symbol": symbol,
                     **result
                 })
 
@@ -351,7 +390,7 @@ def scan_all(lookback=120,
         "source": "USER_PROVIDED_CSV",
         "scanned_files": len(files),
         "signals": signals,
-        "symbols": [f.stem.upper() for f in files],
+        "symbols": sorted(symbols),
         "errors": errors,
         "disclaimer": (
             "Experimental heuristic signals. "
