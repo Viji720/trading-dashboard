@@ -1,4 +1,4 @@
-export const API=process.env.NEXT_PUBLIC_API_URL||'http://127.0.0.1:8000';
+export const API = '';
 export async function api<T>(path:string,init?:RequestInit):Promise<T>{const res=await fetch(`${API}${path}`,{cache:'no-store',...init});const body=await res.json();if(!res.ok)throw new Error(body.detail||'Request failed');return body as T;}
 export type Stock={symbol:string;name:string;price:number};
 export type Candle={time:number;open:number;high:number;low:number;close:number;volume:number};
